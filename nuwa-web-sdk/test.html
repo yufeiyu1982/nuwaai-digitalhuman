@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <script src="nuwasdk/js/npcTalkFloatingButton.js"></script>
+  </head>
+  <body>
+    <script>
+      fetch('https://api.nuwaai.com/web/apiKey/auth', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          secretKey: 'xxxxxx',
+        }),
+      })
+        .then(res => res.json())
+        .then(data => {
+          if (data.code === 0) {
+            console.log('token:', data.data);
+            localStorage.setItem('token', data.data);
+          } else {
+            console.error('请求失败:', data.msg);
+          }
+        })
+        .catch(error => {
+          console.error('请求出错:', error);
+        });
+      new window.NpcTalkFloatingButton({
+        avatorid: 'xxxxx',
+        userid: 'xx',
+        npcPage: 'nuwasdk/index.html',
+      });
+    </script>
+  </body>
+</html>
