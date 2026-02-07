@@ -1,0 +1,628 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CDN 视频播放诊断工具</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Microsoft YaHei', monospace; background: #1a1a2e; color: #e0e0e0; padding: 20px; }
+  h1 { color: #00d4ff; margin-bottom: 20px; font-size: 20px; }
+  h2 { color: #ffa500; margin: 16px 0 8px; font-size: 16px; }
+
+  .config-panel {
+    background: #16213e; border: 1px solid #0f3460; border-radius: 8px;
+    padding: 16px; margin-bottom: 16px;
+  }
+  .config-panel label { display: block; margin-bottom: 4px; color: #aaa; font-size: 13px; }
+  .config-panel input, .config-panel select {
+    width: 100%; padding: 8px; margin-bottom: 12px; background: #0f3460;
+    border: 1px solid #1a1a5e; border-radius: 4px; color: #fff; font-size: 13px;
+  }
+
+  .btn {
+    padding: 10px 20px; border: none; border-radius: 6px; cursor: pointer;
+    font-size: 14px; font-weight: bold; margin-right: 8px; margin-bottom: 8px;
+  }
+  .btn-primary { background: #0f3460; color: #00d4ff; }
+  .btn-primary:hover { background: #1a4a8a; }
+  .btn-danger { background: #5e1a1a; color: #ff6b6b; }
+  .btn-danger:hover { background: #8a2a2a; }
+  .btn-success { background: #1a5e1a; color: #6bff6b; }
+
+  .log-panel {
+    background: #0d1117; border: 1px solid #30363d; border-radius: 8px;
+    padding: 12px; margin-top: 12px; max-height: 500px; overflow-y: auto;
+    font-family: 'Courier New', monospace; font-size: 12px; line-height: 1.6;
+  }
+  .log-entry { border-bottom: 1px solid #21262d; padding: 4px 0; }
+  .log-time { color: #666; }
+  .log-ok { color: #3fb950; }
+  .log-err { color: #f85149; }
+  .log-warn { color: #d29922; }
+  .log-info { color: #58a6ff; }
+  .log-data { color: #bc8cff; }
+  .log-header { color: #00d4ff; font-weight: bold; font-size: 13px; margin: 8px 0 4px; }
+
+  .result-card {
+    background: #16213e; border-radius: 8px; padding: 12px; margin: 8px 0;
+    border-left: 4px solid #555;
+  }
+  .result-card.pass { border-left-color: #3fb950; }
+  .result-card.fail { border-left-color: #f85149; }
+  .result-card.warn { border-left-color: #d29922; }
+
+  .video-test-area {
+    background: #000; border: 2px dashed #333; border-radius: 8px;
+    min-height: 200px; display: flex; align-items: center; justify-content: center;
+    margin: 12px 0; position: relative;
+  }
+  .video-test-area video { max-width: 100%; max-height: 360px; }
+
+  .two-col { display: flex; gap: 16px; }
+  .two-col > div { flex: 1; }
+  @media (max-width: 900px) { .two-col { flex-direction: column; } }
+</style>
+</head>
+<body>
+
+<h1>CDN 视频播放诊断工具</h1>
+
+<!-- 配置区 -->
+<div class="config-panel">
+  <h2>Step 1: 配置连接参数</h2>
+  <div class="two-col">
+    <div>
+      <label>API Secret Key</label>
+      <input id="secretKey" type="text" placeholder="sk-xxxxxx" />
+      <label>数字人 Avatar ID</label>
+      <input id="avatarId" type="text" placeholder="1948262256262123522" />
+      <label>用户 ID</label>
+      <input id="userId" type="text" placeholder="54" />
+    </div>
+    <div>
+      <label>测试提问（触发知识库视频）</label>
+      <input id="testQuestion" type="text" value="播放视频" placeholder="输入能触发视频播放的问题" />
+      <label>手动测试视频 URL（可选，跳过 WebSocket 直接测试）</label>
+      <input id="manualUrl" type="text" placeholder="https://api.nuwaai.com/web/document/download?filename=xxx.mp4" />
+    </div>
+  </div>
+  <button class="btn btn-primary" onclick="startFullDiagnosis()">开始完整诊断（连接WebSocket）</button>
+  <button class="btn btn-primary" onclick="testManualUrl()">仅测试手动 URL</button>
+  <button class="btn btn-danger" onclick="clearLogs()">清空日志</button>
+</div>
+
+<!-- 诊断结果 -->
+<div class="two-col">
+  <div>
+    <h2>诊断日志</h2>
+    <div id="logPanel" class="log-panel"></div>
+  </div>
+  <div>
+    <h2>视频测试区</h2>
+    <div class="video-test-area" id="videoTestArea">
+      <span style="color:#555">等待视频加载...</span>
+    </div>
+    <h2>诊断结论</h2>
+    <div id="resultPanel"></div>
+  </div>
+</div>
+
+<script>
+// ==================== 日志工具 ====================
+function log(msg, cls = 'info') {
+  const panel = document.getElementById('logPanel');
+  const time = new Date().toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit', fractionalSecondDigits: 3 });
+  const div = document.createElement('div');
+  div.className = 'log-entry';
+  div.innerHTML = `<span class="log-time">[${time}]</span> <span class="log-${cls}">${escHtml(msg)}</span>`;
+  panel.appendChild(div);
+  panel.scrollTop = panel.scrollHeight;
+}
+
+function logHeader(msg) {
+  const panel = document.getElementById('logPanel');
+  const div = document.createElement('div');
+  div.innerHTML = `<span class="log-header">${escHtml(msg)}</span>`;
+  panel.appendChild(div);
+}
+
+function addResult(title, detail, status) {
+  const panel = document.getElementById('resultPanel');
+  const div = document.createElement('div');
+  div.className = `result-card ${status}`;
+  div.innerHTML = `<b>${escHtml(title)}</b><br><span style="font-size:12px">${escHtml(detail)}</span>`;
+  panel.appendChild(div);
+}
+
+function escHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function clearLogs() {
+  document.getElementById('logPanel').innerHTML = '';
+  document.getElementById('resultPanel').innerHTML = '';
+  document.getElementById('videoTestArea').innerHTML = '<span style="color:#555">等待视频加载...</span>';
+}
+
+// ==================== URL 转换逻辑（与源码一致） ====================
+const API_PREFIX = "https://api.nuwaai.com/web/document/download?filename=";
+const CDN_PREFIX = "https://res.nuwaai.com/nuwa/";
+
+function transformUrl(src) {
+  return src.replace(API_PREFIX, CDN_PREFIX);
+}
+
+// ==================== 检查项 1: URL 格式匹配性 ====================
+function checkUrlFormat(originalUrl) {
+  logHeader('===== 检查项 1: URL 格式匹配性 =====');
+  log(`服务端返回的原始 URL: ${originalUrl}`, 'data');
+
+  // 检查 replace 是否生效
+  const transformed = transformUrl(originalUrl);
+  const replaceWorked = (transformed !== originalUrl);
+
+  if (replaceWorked) {
+    log(`String.replace() 生效 -> 转换后: ${transformed}`, 'ok');
+    addResult('URL 替换', `replace() 成功生效\n原始: ${originalUrl}\n转换: ${transformed}`, 'pass');
+  } else {
+    log(`String.replace() 未生效！原始 URL 未被替换`, 'err');
+    log(`期望前缀: ${API_PREFIX}`, 'warn');
+    log(`实际 URL: ${originalUrl}`, 'warn');
+
+    // 进一步排查原因
+    if (originalUrl.startsWith('http://api.nuwaai.com')) {
+      log('原因: 协议为 http 而非 https', 'err');
+      addResult('URL 替换失败', '协议不匹配: http vs https', 'fail');
+    } else if (originalUrl.includes('document/download') && !originalUrl.includes('?filename=')) {
+      log('原因: 缺少 ?filename= 参数', 'err');
+      addResult('URL 替换失败', '缺少 ?filename= 查询参数', 'fail');
+    } else if (originalUrl.includes('/web/document/download/')) {
+      log('原因: 路径多了尾部斜杠 download/ vs download', 'err');
+      addResult('URL 替换失败', '路径格式不同: download/ vs download', 'fail');
+    } else if (!originalUrl.includes('api.nuwaai.com')) {
+      log('原因: 域名不是 api.nuwaai.com，服务端返回了其他域名', 'err');
+      addResult('URL 替换失败', `服务端返回了非预期域名`, 'fail');
+    } else {
+      log('原因: URL 格式与预期不匹配（细节差异）', 'err');
+      // 逐字符比较
+      const prefix = API_PREFIX;
+      const urlStart = originalUrl.substring(0, prefix.length);
+      for (let i = 0; i < prefix.length; i++) {
+        if (i >= originalUrl.length || prefix[i] !== originalUrl[i]) {
+          log(`首个差异位置 [${i}]: 期望 '${prefix[i] || 'EOF'}' 实际 '${originalUrl[i] || 'EOF'}'`, 'err');
+          log(`期望: ...${prefix.substring(Math.max(0,i-10), i+10)}...`, 'warn');
+          log(`实际: ...${originalUrl.substring(Math.max(0,i-10), i+10)}...`, 'warn');
+          break;
+        }
+      }
+      addResult('URL 替换失败', `URL 前缀逐字符不匹配`, 'fail');
+    }
+  }
+
+  // 检查额外查询参数
+  if (replaceWorked && transformed.includes('&')) {
+    log(`转换后的 URL 包含 '&' 但没有 '?'，可能是畸形 URL`, 'warn');
+    const qIdx = transformed.indexOf('?');
+    const aIdx = transformed.indexOf('&');
+    if (aIdx !== -1 && (qIdx === -1 || qIdx > aIdx)) {
+      log(`畸形 URL! '&' 出现在 '?' 之前: ${transformed}`, 'err');
+      addResult('URL 畸形', `转换后 URL 缺少 '?' 前缀: & 被当作路径`, 'fail');
+    }
+  }
+
+  // 检查文件名编码
+  try {
+    const url = new URL(originalUrl);
+    const filename = url.searchParams.get('filename');
+    if (filename) {
+      log(`提取到的 filename 参数: ${filename}`, 'info');
+      if (filename !== decodeURIComponent(filename)) {
+        log(`filename 包含 URL 编码字符: ${decodeURIComponent(filename)}`, 'warn');
+      }
+      if (/[%\u4e00-\u9fff]/.test(filename)) {
+        log(`filename 包含中文或编码字符，可能影响 CDN 路径解析`, 'warn');
+        addResult('文件名编码', '文件名包含特殊字符，需确认 CDN 是否支持', 'warn');
+      }
+      if (filename.includes('/')) {
+        log(`filename 包含子路径: ${filename}`, 'warn');
+        log(`转换后 CDN 路径为: ${CDN_PREFIX}${filename}`, 'warn');
+        addResult('文件名含子路径', `filename 含 '/'，CDN 需有对应的目录结构`, 'warn');
+      }
+    } else {
+      log('无法从 URL 中提取 filename 参数', 'err');
+    }
+  } catch (e) {
+    log(`URL 解析失败: ${e.message}`, 'err');
+  }
+
+  return { transformed, replaceWorked };
+}
+
+// ==================== 检查项 2: CDN 可达性 ====================
+async function checkCdnReachability(cdnUrl) {
+  logHeader('===== 检查项 2: CDN 地址可达性 =====');
+  log(`测试 CDN URL: ${cdnUrl}`, 'info');
+
+  try {
+    const startTime = performance.now();
+    const resp = await fetch(cdnUrl, {
+      method: 'HEAD',
+      mode: 'cors',
+      cache: 'no-store',
+    });
+    const elapsed = Math.round(performance.now() - startTime);
+
+    log(`HTTP 状态码: ${resp.status} ${resp.statusText} (${elapsed}ms)`, resp.ok ? 'ok' : 'err');
+    log(`Content-Type: ${resp.headers.get('content-type') || '(无)'}`, 'info');
+    log(`Content-Length: ${resp.headers.get('content-length') || '(无)'}`, 'info');
+    log(`Access-Control-Allow-Origin: ${resp.headers.get('access-control-allow-origin') || '(无)'}`, 'info');
+
+    if (resp.ok) {
+      addResult('CDN HEAD 请求', `${resp.status} OK, ${elapsed}ms`, 'pass');
+      return true;
+    } else if (resp.status === 404) {
+      addResult('CDN HEAD 请求', `404 Not Found - CDN 上不存在该文件路径`, 'fail');
+      return false;
+    } else if (resp.status === 403) {
+      addResult('CDN HEAD 请求', `403 Forbidden - CDN 拒绝访问（可能需要认证或 Referer）`, 'fail');
+      return false;
+    } else {
+      addResult('CDN HEAD 请求', `${resp.status} ${resp.statusText}`, 'fail');
+      return false;
+    }
+  } catch (e) {
+    log(`CDN HEAD 请求异常: ${e.message}`, 'err');
+    if (e.message.includes('CORS') || e.message.includes('cors') || e.name === 'TypeError') {
+      log('可能是 CORS 跨域限制，尝试 no-cors 模式...', 'warn');
+      try {
+        const resp2 = await fetch(cdnUrl, { method: 'HEAD', mode: 'no-cors', cache: 'no-store' });
+        log(`no-cors 模式返回 type: ${resp2.type} (opaque 表示服务器存在但不允许跨域读取)`, 'info');
+        if (resp2.type === 'opaque') {
+          addResult('CDN CORS', '服务器响应了但设置了 CORS 限制，无法从浏览器跨域访问', 'warn');
+        }
+      } catch (e2) {
+        log(`no-cors 也失败: ${e2.message}`, 'err');
+        addResult('CDN 不可达', `网络请求完全失败: ${e.message}`, 'fail');
+      }
+    } else {
+      addResult('CDN 不可达', `请求异常: ${e.message}`, 'fail');
+    }
+    return false;
+  }
+}
+
+// ==================== 检查项 3: API 原始地址可达性 ====================
+async function checkApiReachability(apiUrl) {
+  logHeader('===== 检查项 3: API 原始地址可达性 =====');
+  log(`测试 API URL: ${apiUrl}`, 'info');
+
+  try {
+    const startTime = performance.now();
+    const token = localStorage.getItem('token');
+    const headers = {};
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+      log('已附带 Authorization token', 'info');
+    }
+
+    const resp = await fetch(apiUrl, {
+      method: 'HEAD',
+      mode: 'cors',
+      cache: 'no-store',
+      headers,
+    });
+    const elapsed = Math.round(performance.now() - startTime);
+
+    log(`HTTP 状态码: ${resp.status} ${resp.statusText} (${elapsed}ms)`, resp.ok ? 'ok' : 'err');
+    log(`Content-Type: ${resp.headers.get('content-type') || '(无)'}`, 'info');
+    log(`Content-Length: ${resp.headers.get('content-length') || '(无)'}`, 'info');
+
+    if (resp.ok) {
+      addResult('API 原始地址', `${resp.status} OK, ${elapsed}ms - 可用但慢`, 'pass');
+    } else {
+      addResult('API 原始地址', `${resp.status} ${resp.statusText}`, resp.status === 401 ? 'warn' : 'fail');
+    }
+    return resp.ok;
+  } catch (e) {
+    log(`API HEAD 请求异常: ${e.message}`, 'err');
+    addResult('API 原始地址', `请求异常: ${e.message}`, 'fail');
+    return false;
+  }
+}
+
+// ==================== 检查项 4: 视频实际播放测试 ====================
+async function checkVideoPlayback(url, label) {
+  logHeader(`===== 检查项 4: 实际播放测试 [${label}] =====`);
+  log(`尝试播放: ${url}`, 'info');
+
+  const area = document.getElementById('videoTestArea');
+  area.innerHTML = '';
+
+  const video = document.createElement('video');
+  video.controls = true;
+  video.autoplay = true;
+  video.style.maxWidth = '100%';
+  video.style.maxHeight = '360px';
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        log(`播放超时（15秒无 loadeddata 事件）`, 'err');
+        addResult(`播放测试 [${label}]`, '超时: 15秒内未加载到视频数据', 'fail');
+        resolve(false);
+      }
+    }, 15000);
+
+    video.addEventListener('loadedmetadata', () => {
+      log(`loadedmetadata: 视频尺寸 ${video.videoWidth}x${video.videoHeight}, 时长 ${video.duration.toFixed(1)}s`, 'ok');
+    });
+
+    video.addEventListener('loadeddata', () => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timeout);
+        log(`loadeddata: 视频数据已加载，可以播放`, 'ok');
+        addResult(`播放测试 [${label}]`, `成功! ${video.videoWidth}x${video.videoHeight}, ${video.duration.toFixed(1)}s`, 'pass');
+        resolve(true);
+      }
+    });
+
+    video.addEventListener('error', (e) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timeout);
+        const mediaErr = video.error;
+        const errMsg = mediaErr
+          ? `code=${mediaErr.code}, message=${mediaErr.message || '(无)'}`
+          : '未知错误';
+        log(`视频加载错误: ${errMsg}`, 'err');
+
+        // 解释错误码
+        if (mediaErr) {
+          const errTexts = {
+            1: 'MEDIA_ERR_ABORTED - 加载被中止',
+            2: 'MEDIA_ERR_NETWORK - 网络错误（URL 不可达或 CORS）',
+            3: 'MEDIA_ERR_DECODE - 解码错误（文件损坏或格式不支持）',
+            4: 'MEDIA_ERR_SRC_NOT_SUPPORTED - 资源不支持（404/403/格式错误）',
+          };
+          log(`错误类型: ${errTexts[mediaErr.code] || '未知'}`, 'err');
+        }
+        addResult(`播放测试 [${label}]`, `失败: ${errMsg}`, 'fail');
+        resolve(false);
+      }
+    });
+
+    video.src = url;
+    area.appendChild(video);
+  });
+}
+
+// ==================== 手动 URL 测试 ====================
+async function testManualUrl() {
+  const url = document.getElementById('manualUrl').value.trim();
+  if (!url) {
+    log('请先输入手动测试 URL', 'err');
+    return;
+  }
+
+  clearLogs();
+  logHeader('>>>>>> 手动 URL 诊断开始 <<<<<<');
+
+  // 检查 URL 格式与转换
+  const { transformed, replaceWorked } = checkUrlFormat(url);
+
+  // 测试 CDN 可达性（如果转换生效了）
+  if (replaceWorked) {
+    await checkCdnReachability(transformed);
+  }
+
+  // 测试 API 原始地址
+  if (url.includes('api.nuwaai.com')) {
+    await checkApiReachability(url);
+  }
+
+  // 播放测试 - CDN 地址
+  if (replaceWorked && transformed !== url) {
+    await checkVideoPlayback(transformed, 'CDN 转换后');
+  }
+
+  // 播放测试 - 原始地址
+  await checkVideoPlayback(url, 'API 原始');
+
+  logHeader('>>>>>> 诊断完成 <<<<<<');
+}
+
+// ==================== 完整 WebSocket 诊断 ====================
+async function startFullDiagnosis() {
+  const secretKey = document.getElementById('secretKey').value.trim();
+  const avatarId = document.getElementById('avatarId').value.trim();
+  const userId = document.getElementById('userId').value.trim();
+  const question = document.getElementById('testQuestion').value.trim();
+
+  if (!secretKey || !avatarId || !userId) {
+    log('请先填写 Secret Key、Avatar ID 和 User ID', 'err');
+    return;
+  }
+
+  clearLogs();
+  logHeader('>>>>>> 完整 WebSocket 诊断开始 <<<<<<');
+
+  // Step 1: 获取 token
+  logHeader('===== Step 1: 获取认证 Token =====');
+  let token;
+  try {
+    const resp = await fetch('https://api.nuwaai.com/web/apiKey/auth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ secretKey }),
+    });
+    const data = await resp.json();
+    if (data.code === 0) {
+      token = data.data;
+      localStorage.setItem('token', token);
+      log(`Token 获取成功: ${token.substring(0, 20)}...`, 'ok');
+      addResult('认证', 'Token 获取成功', 'pass');
+    } else {
+      log(`认证失败: ${data.msg}`, 'err');
+      addResult('认证', `失败: ${data.msg}`, 'fail');
+      return;
+    }
+  } catch (e) {
+    log(`认证请求异常: ${e.message}`, 'err');
+    addResult('认证', `请求异常: ${e.message}`, 'fail');
+    return;
+  }
+
+  // Step 2: 建立 WebSocket 连接
+  logHeader('===== Step 2: 建立 WebSocket 连接 =====');
+  const wsUrl = `wss://stdio.nuwaai.com/websk/humanAgent/humanchat/${avatarId}/${userId}?access_token=${token}`;
+  log(`WebSocket URL: ${wsUrl.substring(0, 80)}...`, 'info');
+
+  const ws = new WebSocket(wsUrl);
+  let heartbeatTimer;
+  let videoPlayReceived = false;
+
+  ws.onopen = () => {
+    log('WebSocket 连接成功', 'ok');
+    addResult('WebSocket', '连接成功', 'pass');
+
+    // 心跳
+    heartbeatTimer = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'HEART', timestamp: Date.now(), data: {} }));
+      }
+    }, 10000);
+  };
+
+  ws.onerror = (e) => {
+    log(`WebSocket 错误: ${e}`, 'err');
+    addResult('WebSocket', '连接错误', 'fail');
+  };
+
+  ws.onclose = (e) => {
+    log(`WebSocket 关闭: code=${e.code} reason=${e.reason}`, 'warn');
+    clearInterval(heartbeatTimer);
+  };
+
+  ws.onmessage = async (event) => {
+    if (event.data instanceof Blob) {
+      log(`收到 Blob 消息 (${event.data.size} bytes)`, 'info');
+      return;
+    }
+
+    let msg;
+    try {
+      msg = JSON.parse(event.data);
+    } catch {
+      log(`收到非 JSON 消息: ${event.data.substring(0, 100)}`, 'warn');
+      return;
+    }
+
+    const type = msg.type;
+
+    // 关键消息详细记录
+    switch (type) {
+      case 'avator-load':
+        log(`[${type}] 数字人加载中...`, 'info');
+        break;
+
+      case 'avator-connect':
+        log(`[${type}] code=${msg.code}`, msg.code === 200 ? 'ok' : 'err');
+        if (msg.code === 200) {
+          // 等待连接稳定后发送问题
+          log('等待 3 秒后发送测试问题...', 'info');
+          setTimeout(() => {
+            if (question && ws.readyState === WebSocket.OPEN) {
+              const payload = {
+                type: 'agent',
+                token: token,
+                userid: userId,
+                digitalman_id: avatarId,
+                data: {
+                  sessionid: 'debug-' + Date.now(),
+                  intent: 'UNKNOWN',
+                  content: question,
+                  knowledgeid: 'my_rag_partition',
+                  ext: { name: 'libai' }
+                }
+              };
+              ws.send(JSON.stringify(payload));
+              log(`已发送测试问题: "${question}"`, 'ok');
+              logHeader('===== 等待服务端响应... =====');
+            }
+          }, 3000);
+        }
+        break;
+
+      case 'avator-play':
+        log(`[${type}] code=${msg.code} - RTC 流就绪`, msg.code === 200 ? 'ok' : 'warn');
+        break;
+
+      case 'avator-ctrl': {
+        const ctrl = msg.data || {};
+        log(`[${type}] cmd=${ctrl.cmd}`, 'data');
+
+        if (ctrl.cmd === 'video_play') {
+          videoPlayReceived = true;
+          logHeader('===== 收到 video_play 命令! 开始深度诊断 =====');
+          log(`原始 c.src = ${ctrl.src}`, 'data');
+
+          // 运行完整诊断
+          const { transformed, replaceWorked } = checkUrlFormat(ctrl.src);
+
+          if (replaceWorked) {
+            await checkCdnReachability(transformed);
+          }
+
+          if (ctrl.src.includes('api.nuwaai.com')) {
+            await checkApiReachability(ctrl.src);
+          }
+
+          // 播放测试
+          if (replaceWorked && transformed !== ctrl.src) {
+            const cdnOk = await checkVideoPlayback(transformed, 'CDN 转换后');
+            if (!cdnOk) {
+              log('CDN 播放失败，尝试原始 API 地址...', 'warn');
+              await checkVideoPlayback(ctrl.src, 'API 原始');
+            }
+          } else {
+            await checkVideoPlayback(ctrl.src, 'API 原始');
+          }
+
+          logHeader('>>>>>> 诊断完成 <<<<<<');
+        } else if (ctrl.cmd === 'video_stop') {
+          log(`[${type}] video_stop`, 'info');
+        }
+        break;
+      }
+
+      case 'chat_begin':
+        log(`[${type}] 开始文本响应`, 'info');
+        break;
+
+      case 'chat':
+        if (msg.code === 200 && msg.data) {
+          log(`[${type}] content: ${(msg.data.content || '').substring(0, 80)}...`, 'info');
+        }
+        break;
+
+      case 'chat_over':
+        log(`[${type}] 文本响应结束`, 'info');
+        if (!videoPlayReceived) {
+          log('注意: 未收到 video_play 命令，服务端可能只返回了文本响应', 'warn');
+          addResult('video_play', '未收到 video_play 命令 - 该问题可能没有触发视频播放', 'warn');
+        }
+        break;
+
+      case 'HEART':
+        // 忽略心跳
+        break;
+
+      default:
+        log(`[${type}] ${JSON.stringify(msg).substring(0, 120)}`, 'info');
+    }
+  };
+}
+</script>
+</body>
+</html>
