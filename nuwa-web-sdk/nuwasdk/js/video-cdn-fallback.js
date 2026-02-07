@@ -1,18 +1,22 @@
 /**
- * 视频 CDN 播放 + API 自动降级
+ * 视频播放修复模块
  *
- * 解决两个问题：
- *   1. video_play 处理器调用 getElementById("videoFull") 时，
- *      Vue 还没渲染该元素，返回 null 导致 .play() 崩溃。
- *      → 通过 patch getElementById 返回安全占位元素避免崩溃。
+ * 背景：
+ *   SDK 中 Pe() 和 video_play 处理器将视频 src 从 API 地址转为 res.nuwaai.com CDN 地址，
+ *   但实际文件存储在阿里云 OSS (nuwa-ai.oss-cn-shenzhen.aliyuncs.com)，需要预签名 URL 访问。
+ *   res.nuwaai.com/nuwa/ 上不存在这些文件，导致视频无法播放。
  *
- *   2. Pe() 将 video src 从 API 转为 CDN 地址，但 CDN 路径不存在。
- *      → 通过 MutationObserver 监听 video 元素，CDN 失败时自动回退 API。
+ * 解决：
+ *   1. 拦截错误的 CDN 转换，直接还原为 API 地址（跳过无效的 CDN 等待）
+ *   2. 修复 videoFull 元素在 Vue 渲染前被访问导致的 null 崩溃
+ *
+ * 当后端 video_play 命令改为返回预签名 OSS URL 后（与平台一致），
+ * 此脚本会自动识别为非 CDN 地址，不做任何干预，视频直接播放。
  */
 (function () {
   'use strict';
 
-  var CDN_BASE = 'https://res.nuwaai.com/nuwa/';
+  var BROKEN_CDN = 'https://res.nuwaai.com/nuwa/';
   var API_BASE = 'https://api.nuwaai.com/web/document/download?filename=';
 
   // ==================== Part 1: 修复 videoFull null 崩溃 ====================
@@ -23,9 +27,7 @@
     var el = _origGetElementById(id);
 
     if (id === 'videoFull' && !el) {
-      // Vue 尚未渲染 videoFull，返回一个安全的占位 video
-      // play() 返回 resolved promise，不会崩溃
-      console.warn('[CDN-Fallback] videoFull 尚未渲染，返回占位元素');
+      console.warn('[VideoFix] videoFull 尚未渲染，返回占位元素');
       var dummy = document.createElement('video');
       dummy.play = function () { return Promise.resolve(); };
       dummy.load = function () {};
@@ -35,46 +37,38 @@
     return el;
   };
 
-  // ==================== Part 2: CDN → API 自动降级 ====================
+  // ==================== Part 2: 拦截错误的 CDN 地址，直接用 API ====================
 
-  function cdnToApi(cdnUrl) {
-    if (cdnUrl && cdnUrl.indexOf(CDN_BASE) === 0) {
-      return API_BASE + cdnUrl.substring(CDN_BASE.length);
-    }
-    return null;
-  }
-
-  var HANDLED_ATTR = 'data-cdn-fallback';
-
-  function patchVideo(video) {
-    if (video.getAttribute(HANDLED_ATTR)) return;
-    video.setAttribute(HANDLED_ATTR, '1');
-
+  function fixVideoSrc(video) {
     var src = video.getAttribute('src') || '';
     if (!src) return;
 
-    var apiUrl = cdnToApi(src);
-    if (!apiUrl) return;
+    // 已经是 OSS 预签名 URL → 不干预，直接播放
+    if (src.indexOf('.aliyuncs.com/') !== -1) return;
 
-    video.setAttribute('data-api-src', apiUrl);
-    video.setAttribute('data-cdn-src', src);
+    // 已经是 API 地址 → 不干预
+    if (src.indexOf(API_BASE) === 0) return;
 
-    console.log('[CDN-Fallback] 检测到 CDN 视频:', src);
-
-    video.addEventListener('error', function () {
-      var currentSrc = video.getAttribute('src') || '';
-      var fallback = video.getAttribute('data-api-src');
-
-      if (currentSrc.indexOf(CDN_BASE) === 0 && fallback) {
-        console.warn('[CDN-Fallback] CDN 加载失败，降级到 API:', fallback);
-        video.setAttribute('src', fallback);
-        video.load();
-        video.play().catch(function () {});
-      }
-    }, { once: true });
+    // 是错误的 CDN 地址 → 还原为 API 地址
+    if (src.indexOf(BROKEN_CDN) === 0) {
+      var filename = src.substring(BROKEN_CDN.length);
+      var apiUrl = API_BASE + filename;
+      console.log('[VideoFix] 跳过无效 CDN，直接使用 API:', apiUrl);
+      video.setAttribute('src', apiUrl);
+      video.load();
+      video.play().catch(function () {});
+    }
   }
 
   // ==================== Part 3: MutationObserver ====================
+
+  var HANDLED = 'data-video-fixed';
+
+  function patchVideo(video) {
+    if (video.getAttribute(HANDLED)) return;
+    video.setAttribute(HANDLED, '1');
+    fixVideoSrc(video);
+  }
 
   function scanExisting() {
     var videos = document.querySelectorAll('video');
@@ -88,6 +82,7 @@
       for (var i = 0; i < mutations.length; i++) {
         var mutation = mutations[i];
 
+        // 新增节点
         if (mutation.addedNodes) {
           for (var j = 0; j < mutation.addedNodes.length; j++) {
             var node = mutation.addedNodes[j];
@@ -97,18 +92,19 @@
               patchVideo(node);
             }
             if (node.querySelectorAll) {
-              var innerVideos = node.querySelectorAll('video');
-              for (var k = 0; k < innerVideos.length; k++) {
-                patchVideo(innerVideos[k]);
+              var inner = node.querySelectorAll('video');
+              for (var k = 0; k < inner.length; k++) {
+                patchVideo(inner[k]);
               }
             }
           }
         }
 
+        // src 属性变化
         if (mutation.type === 'attributes' &&
             mutation.attributeName === 'src' &&
             mutation.target.tagName === 'VIDEO') {
-          mutation.target.removeAttribute(HANDLED_ATTR);
+          mutation.target.removeAttribute(HANDLED);
           patchVideo(mutation.target);
         }
       }
@@ -134,5 +130,5 @@
     startObserver();
   }
 
-  console.log('[CDN-Fallback] 视频 CDN 降级模块已加载');
+  console.log('[VideoFix] 视频播放修复模块已加载');
 })();
