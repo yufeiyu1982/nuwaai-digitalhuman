@@ -375,3 +375,136 @@ fetch(cdnUrl, { method: 'HEAD' })
 2. **比较转换前后的 URL**：手动在浏览器中访问转换后的 CDN URL，查看是否返回 404
 3. **检查 Network 面板**：观察视频请求的 HTTP 状态码（404 = 路径错误，403 = 权限问题，CORS error = 跨域问题）
 4. **查看 `console.log("视频宽高比:", ue.value)` 的输出**：确认 RTC 流是否正常加载以及 `he.value` 的状态
+
+---
+
+## 九、实际诊断结果（已验证）
+
+### 9.1 核心发现：视频实际投递方式与预期不同
+
+通过 `debug-video.html` 诊断工具实际连接 WebSocket 测试后发现：
+
+**服务端没有发送 `avator-ctrl` + `video_play` 命令。**
+
+视频 URL 是作为 **`chat` 类型消息的 Markdown 文本内容** 逐字符流式返回的。还原碎片后的完整内容：
+
+```markdown
+![](https://api.nuwaai.com/web/document/download?filename=34004/knowledge/2005842614496083969/2a8611798e6a4da3be12a3358b36e3b9.mp4" controls=controls width=460 height=280 voice=1")
+```
+
+### 9.2 真正的视频处理链路
+
+```
+用户提问
+  ↓
+WebSocket 发送 {type:"agent", data:{content:"xxx", knowledgeid:"my_rag_partition"}}
+  ↓
+服务端返回 {type:"chat", data:{content:"..."}}  (流式，逐字符)
+  ↓
+客户端累积: ke.respText += content
+  ↓
+Marked 渲染 Markdown → 自定义 image rule 检测到 .mp4 后缀
+  ↓
+渲染为: <video src="https://api.nuwaai.com/web/document/download?filename=34004/knowledge/.../xxx.mp4" controls width="460" height="280"></video>
+  ↓
+Pe() 函数: querySelectorAll("video") → 对每个 video 的 src 执行 replace()
+  ↓
+转换为: <video src="https://res.nuwaai.com/nuwa/34004/knowledge/.../xxx.mp4" ...></video>
+  ↓
+CDN 路径不存在 → 视频加载失败 → 无画面
+```
+
+### 9.3 自定义 Markdown Image 渲染器（关键代码）
+
+```javascript
+t.renderer.rules.image = function(e, t, n, r, s) {
+  const o = e[t], i = o.attrGet("src");
+  // 当 src 以 .mp4 结尾时，渲染为 <video> 标签
+  return i && i.endsWith(".mp4")
+    ? `<video src="${i}" controls width="460" height="280"></video>`
+    : `<img class="clickable-image" onclick="window.imageClick(this)"
+           data-src="${i}" src="${i}" alt="${a}" title="${l}"
+           style="max-width: 100%; height: auto; border-radius: 8px;" />`;
+};
+```
+
+### 9.4 Pe() 函数（URL 转换处理器）
+
+```javascript
+function Pe(e, t) {
+  const n = (new DOMParser).parseFromString(e, "text/html");
+  // 只处理 <video> 标签，对 <img> 不做转换
+  n.querySelectorAll("video").forEach((e => {
+    const n = e.getAttribute("src");
+    if (n) {
+      const r = t(n.trim());
+      e.setAttribute("src", r);
+    }
+  }));
+  return n.body.innerHTML;
+}
+```
+
+### 9.5 实际的 URL 转换结果
+
+| 阶段 | URL |
+|------|-----|
+| **服务端返回** | `https://api.nuwaai.com/web/document/download?filename=34004/knowledge/2005842614496083969/2a8611798e6a4da3be12a3358b36e3b9.mp4` |
+| **replace() 后** | `https://res.nuwaai.com/nuwa/34004/knowledge/2005842614496083969/2a8611798e6a4da3be12a3358b36e3b9.mp4` |
+| **CDN 状态** | 不可达（路径不存在或 403） |
+
+**filename 是多层子路径**：`34004/knowledge/2005842614496083969/2a8611798e6a4da3be12a3358b36e3b9.mp4`
+
+这意味着 CDN 上需要存在 `/nuwa/34004/knowledge/2005842614496083969/` 这个完整的目录结构才能访问到该文件。
+
+### 9.6 确认的根因
+
+| # | 原因 | 验证结果 |
+|---|------|---------|
+| 1 | `replace()` 是否生效 | **生效** — URL 前缀匹配成功 |
+| 2 | 转换后 CDN 路径是否可达 | **不可达** — CDN 上不存在该多层子路径 |
+| 3 | API 原始地址是否可用 | **可用** — 去掉 replace 后能播放（但慢） |
+
+**根本原因：CDN（`res.nuwaai.com`）上的文件存储路径结构与 API 的 `filename` 参数结构不一致。**
+
+### 9.7 针对性修复建议
+
+既然根因已明确（CDN 路径不匹配），修复方向为：
+
+#### 方案 A：后端修复 CDN 文件路径映射（推荐）
+
+确保文件上传到 CDN 时，保持与 `filename` 参数一致的目录结构：
+```
+res.nuwaai.com/nuwa/34004/knowledge/2005842614496083969/2a8611798e6a4da3be12a3358b36e3b9.mp4
+```
+或在 CDN（如 Nginx/OSS）配置 URL 重写规则，将该路径映射到实际存储位置。
+
+#### 方案 B：前端修改 URL 转换规则
+
+如果 CDN 上的文件路径结构与 `filename` 不同（例如文件统一存放在 `/nuwa/` 根目录下），则需修改转换逻辑：
+
+```javascript
+// 示例：提取纯文件名（去掉子目录）
+function transformVideoUrl(src) {
+  try {
+    const url = new URL(src);
+    const filename = url.searchParams.get('filename');
+    if (filename) {
+      const basename = filename.split('/').pop(); // 只取文件名
+      return `https://res.nuwaai.com/nuwa/${basename}`;
+    }
+    return src;
+  } catch {
+    return src;
+  }
+}
+```
+
+#### 方案 C：前端取消 URL 转换 + 后端优化 API 下载速度
+
+直接使用 API 原始地址，同时在后端为 `/web/document/download` 接口添加缓存和 Range 请求支持以提升速度：
+
+```javascript
+// Pe() 中不做 replace，直接返回原始 URL
+// 或在 Marked 渲染时就不转换
+```
